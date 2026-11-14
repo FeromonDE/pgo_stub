@@ -1,8 +1,7 @@
 name: Build PlayGo 0.6 (manual)
 
-# Build only when explicitly started from Actions > Run workflow.
-# Requires a Windows self-hosted runner with Visual Studio/MSBuild and
-# the PS5 Prospero SDK installed. GitHub-hosted runners lack that SDK.
+# Only an explicit Actions > Run workflow starts a build.
+# Uses a GitHub-hosted Ubuntu runner and the public PS5 Payload SDK.
 on:
   workflow_dispatch:
 
@@ -15,41 +14,140 @@ concurrency:
 
 jobs:
   build-log:
-    name: Build ReleaseLog SPRX
-    runs-on: [self-hosted, Windows, X64]
-    timeout-minutes: 30
+    name: Build and verify ReleaseLog SPRX
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - name: Checkout repository
+      - name: Checkout PlayGo source
         uses: actions/checkout@v4
 
-      - name: Locate MSBuild
-        uses: microsoft/setup-msbuild@v2
-
-      - name: Install Python for project build helpers
-        uses: actions/setup-python@v5
+      - name: Checkout tested PRX build tools
+        uses: actions/checkout@v4
         with:
-          python-version: '3.12'
+          repository: FeromonDE/dlc_emu
+          ref: a86ca63a2ea90514a64bbb13cd9452db9cd5eaa8
+          path: _ci/dlc-buildkit
 
-      - name: Build PS5 ReleaseLog
-        shell: pwsh
-        run: |
-          msbuild .\libScePlayGo.sln /m /p:Configuration=ReleaseLog /p:Platform=Prospero /v:minimal
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Checkout public PS5 SDK package recipes
+        uses: actions/checkout@v4
+        with:
+          repository: ps5-payload-dev/pacbrew-repo
+          path: _ci/pacbrew-repo
 
-      - name: Verify generated SPRX
-        shell: pwsh
+      - name: Install build prerequisites
+        shell: bash
         run: |
-          $sprx = 'out/log/libScePlayGo.sprx'
-          if (-not (Test-Path -LiteralPath $sprx -PathType Leaf)) {
-            throw "Build completed without expected output: $sprx"
-          }
-          Get-Item -LiteralPath $sprx | Select-Object FullName, Length
-          Get-FileHash -LiteralPath $sprx -Algorithm SHA256
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake build-essential clang-18 cmake curl git \
+            libarchive-tools libtool lld-18 makepkg meson \
+            pacman-package-manager pkg-config python3 zip
+
+      - name: Install public PS5 Payload SDK
+        shell: bash
+        working-directory: _ci/pacbrew-repo/sdk
+        run: |
+          set -euo pipefail
+          makepkg --nodeps -c -f
+          staging="$(mktemp -d)"
+          bsdtar -xf ./ps5-payload-sdk-*.pkg.tar.* -C "$staging"
+          test -f "$staging/opt/ps5-payload-sdk/toolchain/prospero.mk"
+          sudo mkdir -p /opt/ps5-payload-sdk
+          sudo cp -a "$staging/opt/ps5-payload-sdk/." /opt/ps5-payload-sdk/
+          rm -rf "$staging"
+
+      - name: Install public PS5 libc++ headers
+        shell: bash
+        working-directory: _ci/pacbrew-repo/libcxx
+        run: |
+          set -euo pipefail
+          makepkg --nodeps -c -f
+          staging="$(mktemp -d)"
+          bsdtar -xf ./ps5-payload-libcxx-*.pkg.tar.* -C "$staging"
+          test -d "$staging/opt/ps5-payload-sdk/target"
+          sudo cp -a "$staging/opt/ps5-payload-sdk/." /opt/ps5-payload-sdk/
+          rm -rf "$staging"
+          test -d /opt/ps5-payload-sdk/target/include/c++/v1
+
+      - name: Prepare PS5 PRX build without modifying PlayGo source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp library.cpp _ci/dlc-buildkit/src/dlc_modules/playgo.cpp
+          cp library.h _ci/dlc-buildkit/src/dlc_modules/library.h
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          kit = Path("_ci/dlc-buildkit")
+          header = Path("library.h").read_text(encoding="utf-8-sig")
+          functions = re.findall(
+              r"PRX_INTERFACE\s+int32_t\s+(scePlayGo\w+)\s*\(", header
+          )
+          if len(functions) < 20 or len(functions) != len(set(functions)):
+              raise ValueError(f"Unexpected PlayGo exported functions: {functions!r}")
+          pemd = (
+              "# PlayGo 0.6 exports derived from library.h\n"
+              "Module: libScePlayGo\n\n"
+              "Library: libScePlayGo {\n"
+              "  version: 1\n"
+              "  stubfile: libScePlayGo_stub\n\n"
+              + "".join(f"  function: {name}\n" for name in functions)
+              + "}\n"
+          )
+          (kit / "msbuild/pemd/libScePlayGo.pemd").write_text(pemd)
+
+          makefile_path = kit / "Makefile"
+          makefile = makefile_path.read_text()
+          def replace_once(original, replacement):
+              global makefile
+              if makefile.count(original) != 1:
+                  raise RuntimeError(f"Makefile template changed: {original}")
+              makefile = makefile.replace(original, replacement)
+          replace_once(
+              "MODULES ?= libSceAppContent libSceGameUpdate libSceNpEntitlementAccess",
+              "MODULES ?= libScePlayGo",
+          )
+          replace_once(
+              "COMMON_SOURCES := src/dlc_modules/dlc_content.cpp src/dlc_modules/dlc_log.cpp",
+              "COMMON_SOURCES := src/dlc_modules/playgo.cpp\n"
+              "libScePlayGo_EXPORTS :=\n"
+              "libScePlayGo_DEFS := -DLIBRARY_IMPL=1",
+          )
+          makefile_path.write_text(makefile)
+
+          gen_path = kit / "tools/generate_payload_exports.py"
+          generator = gen_path.read_text()
+          anchor = "\nKERNEL_IMPORTS = {"
+          if generator.count(anchor) != 1:
+              raise RuntimeError("PRX import classification template changed")
+          generator = generator.replace(
+              anchor,
+              '\nLIBC_IMPORTS.update({\n'
+              '    "fclose", "ferror", "fgetc", "fgets", "fopen",\n'
+              '    "fprintf", "fputc", "strspn", "strtok_r", "vfprintf",\n'
+              '})\n' + anchor,
+          )
+          gen_path.write_text(generator)
+          print(f"Prepared {len(functions)} PlayGo exports; source code unchanged")
+          PY
+
+      - name: Build and verify PlayGo with logging enabled
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C _ci/dlc-buildkit -j"$(nproc)" verify \
+            OUT=out/playgo-log MODULES=libScePlayGo \
+            EXTRA_DEFS="-DPLAYGO_ENABLE_LOGGING=1 -D__PROSPERO__=1" \
+            PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+          test -s _ci/dlc-buildkit/out/playgo-log/libScePlayGo.sprx
+          sha256sum _ci/dlc-buildkit/out/playgo-log/libScePlayGo.sprx
 
       - name: Upload logging SPRX
         uses: actions/upload-artifact@v4
         with:
           name: libScePlayGo-0.6-ReleaseLog
-          path: out/log/libScePlayGo.sprx
+          path: _ci/dlc-buildkit/out/playgo-log/libScePlayGo.sprx
           if-no-files-found: error
           retention-days: 14
