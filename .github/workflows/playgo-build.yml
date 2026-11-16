@@ -1,9 +1,21 @@
-name: Build PlayGo 0.6 (manual)
+name: Build PlayGo diagnostic
 
-# Only an explicit Actions > Run workflow starts a build.
+# Build source changes and manual requests.
 # Uses a GitHub-hosted Ubuntu runner and the public PS5 Payload SDK.
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      source_ref:
+        type: string
+        required: true
+  push:
+    branches: [main]
+    paths:
+      - "library.cpp"
+      - "library.h"
+      - "tools/**"
+      - ".github/workflows/playgo-build.yml"
 
 permissions:
   contents: read
@@ -16,10 +28,17 @@ jobs:
   build-log:
     name: Build and verify ReleaseLog SPRX
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     timeout-minutes: 60
     steps:
       - name: Checkout PlayGo source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+
+      - name: Verify mounted-image log path
+        run: python3 tools/patch_download_log.py --check
 
       - name: Checkout tested PRX build tools
         uses: actions/checkout@v4
@@ -147,7 +166,28 @@ jobs:
       - name: Upload logging SPRX
         uses: actions/upload-artifact@v4
         with:
-          name: libScePlayGo-0.6-ReleaseLog
+          name: libScePlayGo-ReleaseLog
           path: _ci/dlc-buildkit/out/playgo-log/libScePlayGo.sprx
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish diagnostic build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_ref || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import re; from pathlib import Path; print(re.search(r"kPlayGoStubVersion\s*=\s*\"([^\"\n]+)\"", Path("library.cpp").read_text(encoding="utf-8-sig")).group(1))')
+          tag="download-${version}-${SOURCE_SHA:0:7}"
+          mkdir -p release
+          cp _ci/dlc-buildkit/out/playgo-log/libScePlayGo.sprx release/
+          (cd release && sha256sum libScePlayGo.sprx > SHA256SUMS)
+          printf 'PlayGo %s diagnostic build.\n\nLog: `/download/playlgo.log`. Suitable for mounted read-only images.\n\nSource: %s\n' "$version" "$SOURCE_SHA" > release-notes.md
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber release/libScePlayGo.sprx release/SHA256SUMS
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" \
+              --title "PlayGo $version diagnostic (/download)" --notes-file release-notes.md \
+              release/libScePlayGo.sprx release/SHA256SUMS
+          fi

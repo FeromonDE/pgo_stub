@@ -2,7 +2,7 @@
 
 `libScePlayGo` is a lightweight replacement module for the PlayGo runtime library on PlayStation 5 targets.
 
-Current version: **0.5**.
+Current version: **0.6**.
 
 The module provides the common PlayGo entry points expected by titles that query installation state, chunk availability, language masks, optional chunks, and progress. It is designed for environments where the real PlayGo service is not available or not useful, while still letting software continue through its normal PlayGo checks.
 
@@ -91,8 +91,10 @@ english_us,8,english_gb
 Logging is disabled by default. When built with logging enabled, the module writes a simple call log to:
 
 ```text
-/app0/playlgo.log
+/download/playlgo.log
 ```
+
+The log is outside the mounted game image, so logging does not require a writable `/app0`. The log is truncated when the module starts.
 
 The log is intended to help identify which PlayGo calls a title makes and what the stub returned.
 
@@ -125,3 +127,9 @@ After successful initialization and opening a valid handle, the stub accepts `nu
 This is a compatibility extension, not a claim about original SDK behavior. The local original PS5 PlayGo reference checks pointers before the count and rejects counts outside 1..1000 in these APIs.
 
 Nonempty lists retain pointer, size, and chunk validation. Empty lists still require an initialized library and a valid open handle.
+
+## Fork diagnostic builds
+
+Source changes on `main` build and verify the logging SPRX with the public PS5 Payload SDK, then publish it with `SHA256SUMS` in this fork's Releases. The source commit is recorded in each release.
+
+`Patch and build upstream releases` checks the latest stable `drakmor/pgo_stub` release every six hours. A new release is merged into this fork, the `/download/playlgo.log` patch is reapplied and checked, and the diagnostic build is published. Existing fork changes are preserved by the merge. A merge conflict or an unexpected logging implementation stops the update for review. Unchanged releases are not rebuilt; failed builds are retried. Both workflows also support manual runs.

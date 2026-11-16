@@ -106,7 +106,7 @@ static const char* const kLanguageNames[] = {
 
 #if PLAYGO_ENABLE_LOGGING
 static void pg_log_reset(void) {
-    FILE* fp = fopen("/data/shadowmount/playlgo.log", "wb");
+    FILE* fp = fopen("/download/playlgo.log", "wb");
     if (fp != NULL) {
         fclose(fp);
     }
@@ -116,7 +116,7 @@ static void pg_logf(const char* fmt, ...) {
     FILE* fp;
     va_list ap;
 
-    fp = fopen("/data/shadowmount/playlgo.log", "ab");
+    fp = fopen("/download/playlgo.log", "ab");
     if (fp == NULL) {
         return;
     }

@@ -1,0 +1,72 @@
+name: Patch and build upstream releases
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.sync.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Merge latest upstream release and preserve the log patch
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=$(gh api repos/drakmor/pgo_stub/releases/latest --jq .tag_name)
+          git fetch --no-tags https://github.com/drakmor/pgo_stub.git "refs/tags/$tag"
+          upstream_sha=$(git rev-parse 'FETCH_HEAD^{commit}')
+          previous=$(python3 -c 'import json; print(json.load(open(".github/upstream-release.json"))["sha"])')
+          if [ "$upstream_sha" != "$previous" ]; then
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git merge --no-commit --no-ff "$upstream_sha"
+            python3 tools/patch_download_log.py
+            python3 tools/patch_download_log.py --check
+            UPSTREAM_TAG="$tag" UPSTREAM_SHA="$upstream_sha" python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path('.github/upstream-release.json').write_text(json.dumps({
+              'repository': 'drakmor/pgo_stub',
+              'tag': os.environ['UPSTREAM_TAG'],
+              'sha': os.environ['UPSTREAM_SHA'],
+          }, indent=2) + '\n')
+          PY
+            git add -A
+            git commit -m "Merge PlayGo $tag with diagnostic log in /download"
+            git push origin HEAD:main
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          else
+            # A failed build is retried; a completed release is never rebuilt.
+            sha=$(git rev-parse HEAD)
+            short=${sha:0:7}
+            count=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --jq "[.[] | select(.tag_name | endswith(\"-$short\")) | .assets[] | select(.name == \"libScePlayGo.sprx\")] | length")
+            if [ "$count" -eq 0 ]; then
+              echo "sha=$sha" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.sha != ''
+    uses: ./.github/workflows/playgo-build.yml
+    with:
+      source_ref: ${{ needs.sync.outputs.sha }}
